@@ -1,8 +1,8 @@
 import os, requests
 
-TOKEN = os.environ["TELEGRAM_TOKEN"]
-CHAT = os.environ["CHAT_ID"]
-KEY = os.environ["TWELVE_KEY"]
+TOKEN = os.environ["TELEGRAM_TOKEN"].strip()
+CHAT = os.environ["CHAT_ID"].strip()
+KEY = os.environ["TWELVE_KEY"].strip()
 
 def get_candles(interval="5min", size=5):
     r = requests.get(
@@ -13,10 +13,13 @@ def get_candles(interval="5min", size=5):
     return r.json()
 
 def send(text):
-    requests.post(
+    r = requests.post(
         f"https://api.telegram.org/bot{TOKEN}/sendMessage",
         data={"chat_id": CHAT, "text": text}, timeout=20)
+    print("TELEGRAM STATUS:", r.status_code)
+    print("TELEGRAM REPLY:", r.text)
 
+print("Token length:", len(TOKEN), "| Chat ID length:", len(CHAT))
 data = get_candles()
 if "values" in data:
     price = data["values"][0]["close"]
