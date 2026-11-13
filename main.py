@@ -1,47 +1,76 @@
 import os, json, requests
+from datetime import datetime, timedelta
 
 TOKEN = os.environ["TELEGRAM_TOKEN"].strip()
 CHAT = os.environ["CHAT_ID"].strip()
 KEY = os.environ["TWELVE_KEY"].strip()
 MANUAL = os.environ.get("GITHUB_EVENT_NAME") == "workflow_dispatch"
 
-MIN_RR = 2
+RR = 3
 N = 3
 BUFFER = 0.5
-MIN_RISK = 2.0
-ENTRY_TFS = ["15min", "1h"]
-STATE_FILE = "sent.json"
+MIN_RISK = 5.0
+MAX_HOLD = 100   # candles before a time stop
+MAX_EXT = 2      # max TP extensions per trade
+STATE_FILE = "trades.json"
+
+# timeframe, minutes, higher timeframe that must agree (None = any trend)
+SCANS = [("1h", 60, None), ("4h", 240, "1day"), ("1day", 1440, None)]
+MINS = {"1h": 60, "4h": 240, "1day": 1440}
 
 def send(text):
-    r = requests.post(
-        f"https://api.telegram.org/bot{TOKEN}/sendMessage",
-        data={"chat_id": CHAT, "text": text}, timeout=20)
-    print("TELEGRAM:", r.status_code, r.text[:100])
+    try:
+        r = requests.post(
+            f"https://api.telegram.org/bot{TOKEN}/sendMessage",
+            data={"chat_id": CHAT, "text": text[:4000]}, timeout=20)
+        print("TELEGRAM:", r.status_code)
+    except Exception as ex:
+        print("Telegram error:", ex)
+
+def parse(s):
+    s = s.strip()
+    if len(s) == 10:
+        s += " 00:00:00"
+    return datetime.strptime(s[:19], "%Y-%m-%d %H:%M:%S")
 
 def load_state():
     try:
         with open(STATE_FILE) as f:
-            return json.load(f)
+            s = json.load(f)
     except Exception:
-        return []
+        s = {}
+    s.setdefault("sent", [])
+    s.setdefault("open", [])
+    s.setdefault("stats", {"w": 0, "l": 0, "be": 0, "r": 0.0})
+    return s
 
 def save_state(s):
+    s["sent"] = s["sent"][-300:]
     with open(STATE_FILE, "w") as f:
-        json.dump(s[-300:], f)
+        json.dump(s, f, indent=1)
 
-def get_candles(interval, size=150):
-    r = requests.get(
-        "https://api.twelvedata.com/time_series",
-        params={"symbol": "XAU/USD", "interval": interval,
-                "outputsize": size, "apikey": KEY},
-        timeout=20)
-    d = r.json()
-    if "values" not in d:
-        return None, d.get("message", "unknown")
-    rows = [{"t": v["datetime"], "h": float(v["high"]),
-             "l": float(v["low"]), "c": float(v["close"])}
-            for v in reversed(d["values"])]
-    return rows[:-1], None
+CACHE, ERRORS = {}, []
+def candles(interval, size=150):
+    if interval in CACHE:
+        return CACHE[interval]
+    rows = None
+    try:
+        r = requests.get(
+            "https://api.twelvedata.com/time_series",
+            params={"symbol": "XAU/USD", "interval": interval,
+                    "outputsize": size, "apikey": KEY}, timeout=30)
+        d = r.json()
+        if "values" in d:
+            rows = [{"t": v["datetime"], "dt": parse(v["datetime"]),
+                     "o": float(v["open"]), "h": float(v["high"]),
+                     "l": float(v["low"]), "c": float(v["close"])}
+                    for v in reversed(d["values"])][:-1]  # drop forming candle
+        else:
+            ERRORS.append(f"{interval}: {d.get('message', 'unknown')}")
+    except Exception as ex:
+        ERRORS.append(f"{interval}: {ex}")
+    CACHE[interval] = rows
+    return rows
 
 def swings(rows):
     highs, lows = [], []
@@ -67,103 +96,154 @@ def build(side, entry, sl):
     risk = abs(entry - sl)
     if risk < MIN_RISK:
         return None
-    tp = entry + MIN_RR * risk if side == "BUY" else entry - MIN_RR * risk
+    tp = entry + RR * risk if side == "BUY" else entry - RR * risk
     return (side, entry, sl, tp)
 
-# ---------- Strategy 1: break of structure ----------
-def structure(rows, want):
+def mss(rows, want):
+    """Market shift: old trend flips, last swing breaks, displacement candle."""
     highs, lows = swings(rows)
-    if not highs or not lows:
+    if len(highs) < 2 or len(lows) < 2 or len(rows) < 25:
         return None
-    last, prev = rows[-1]["c"], rows[-2]["c"]
-    H, L = highs[-1], lows[-1]
-    if want == "BUY" and prev <= H < last:
-        return build("BUY", last, L - BUFFER)
-    if want == "SELL" and prev >= L > last:
-        return build("SELL", last, H + BUFFER)
-    return None
-
-# ---------- Strategy 2: fair value gap retest ----------
-def fvg(rows, want):
-    last = rows[-1]
-    for i in range(len(rows) - 2, max(len(rows) - 32, 2), -1):
-        a, c = rows[i - 2], rows[i]
-        between = rows[i + 1:-1]
-        if want == "BUY" and a["h"] < c["l"]:
-            lo, hi = a["h"], c["l"]
-            if any(x["l"] <= hi for x in between):
-                continue  # gap already tested
-            if last["l"] <= hi and last["c"] > lo:
-                return build("BUY", last["c"], lo - BUFFER)
-            return None
-        if want == "SELL" and a["l"] > c["h"]:
-            lo, hi = c["h"], a["l"]
-            if any(x["h"] >= lo for x in between):
-                continue
-            if last["h"] >= lo and last["c"] < hi:
-                return build("SELL", last["c"], hi + BUFFER)
-            return None
-    return None
-
-# ---------- Strategy 3: liquidity sweep ----------
-def sweep(rows, want):
-    highs, lows = swings(rows)
     last, prev = rows[-1], rows[-2]
-    if want == "SELL" and highs:
-        H = highs[-1]
-        if last["h"] > H and last["c"] < H and prev["h"] <= H:
-            return build("SELL", last["c"], last["h"] + BUFFER)
-    if want == "BUY" and lows:
-        L = lows[-1]
-        if last["l"] < L and last["c"] > L and prev["l"] >= L:
-            return build("BUY", last["c"], last["l"] - BUFFER)
+    bodies = [abs(x["c"] - x["o"]) for x in rows[-21:-1]]
+    avg = sum(bodies) / len(bodies)
+    body = abs(last["c"] - last["o"])
+    rng = last["h"] - last["l"]
+    if rng <= 0 or body < 1.5 * avg or body < 0.6 * rng:
+        return None
+    was_down = highs[-1] < highs[-2] and lows[-1] < lows[-2]
+    was_up = highs[-1] > highs[-2] and lows[-1] > lows[-2]
+    if want == "BUY" and was_down and last["c"] > last["o"] \
+            and prev["c"] <= highs[-1] < last["c"]:
+        return build("BUY", last["c"], lows[-1] - BUFFER)
+    if want == "SELL" and was_up and last["c"] < last["o"] \
+            and prev["c"] >= lows[-1] > last["c"]:
+        return build("SELL", last["c"], highs[-1] + BUFFER)
     return None
-
-STRATS = [("Structure break", structure),
-          ("Fair value gap", fvg),
-          ("Liquidity sweep", sweep)]
 
 state = load_state()
-rows4, err = get_candles("4h")
-if err:
-    print("Error:", err)
-    if MANUAL:
-        send(f"Minas error: {err}")
-else:
-    trend = bias(rows4)
-    print("4h bias:", trend)
-    if trend is None:
-        if MANUAL:
-            send("Minas scan done: no clear 4h trend, no trades.")
-    else:
-        sent_any = False
-        for tf in ENTRY_TFS:
-            rows, err = get_candles(tf)
-            if err:
-                print(tf, "error:", err)
-                continue
-            hits = []
-            for name, fn in STRATS:
-                s = fn(rows, trend)
-                if s:
-                    hits.append((name, s))
-            new = [(n, s) for n, s in hits
-                   if f"{n}:{tf}:{trend}:{rows[-1]['t']}" not in state]
-            if not new:
-                continue
-            side, e, sl, tp = new[0][1]
-            names = " + ".join(n for n, _ in new)
-            strength = "STRONG (confluence)" if len(new) > 1 else "Normal"
-            send(f"Gold {side} ({tf})\n"
-                 f"Setup: {names}\n"
-                 f"Strength: {strength}\n"
-                 f"4h trend: {trend}\n"
-                 f"Entry: {e:.2f}\nSL: {sl:.2f}\nTP: {tp:.2f}\n"
-                 f"RR: 1:{MIN_RR}")
-            for n, _ in new:
-                state.append(f"{n}:{tf}:{trend}:{rows[-1]['t']}")
-            sent_any = True
-        if not sent_any and MANUAL:
-            send(f"Minas scan done: 4h trend {trend}, no setup right now.")
 
+def record_text():
+    s = state["stats"]
+    return f"Record: {s['w']}W {s['l']}L {s['be']}BE | total {s['r']:+.1f}R"
+
+def track():
+    keep = []
+    for t in state["open"]:
+        rows = candles(t["tf"])
+        if not rows or len(rows) < 5:
+            keep.append(t)
+            continue
+        side, e, risk = t["side"], t["entry"], t["risk"]
+        sign = 1 if side == "BUY" else -1
+        done = False
+        for x in rows:
+            if x["dt"] <= parse(t["checked"]):
+                continue
+            t["checked"] = x["t"]
+            t["n"] += 1
+            if side == "BUY":
+                hit_sl, hit_tp = x["l"] <= t["sl"], x["h"] >= t["tp"]
+            else:
+                hit_sl, hit_tp = x["h"] >= t["sl"], x["l"] <= t["tp"]
+            if hit_sl:  # stop checked first (conservative)
+                r = sign * (t["sl"] - e) / risk
+                why = "Stop loss hit" if r < -0.01 else "Stopped at breakeven"
+            elif hit_tp:
+                r = sign * (t["tp"] - e) / risk
+                why = "Take profit hit"
+            elif t["n"] >= MAX_HOLD:
+                r = sign * (x["c"] - e) / risk
+                why = "Time stop: close the trade at market"
+            else:
+                continue
+            st = state["stats"]
+            st["r"] += r
+            if r > 0.01:
+                st["w"] += 1
+            elif r < -0.01:
+                st["l"] += 1
+            else:
+                st["be"] += 1
+            send(f"Gold {side} ({t['tf']}): {why}\n"
+                 f"Result: {r:+.1f}R\n{record_text()}")
+            done = True
+            break
+        if done:
+            continue
+        # TP extension: new break of structure in the trade's direction
+        last, prev = rows[-1], rows[-2]
+        if t["ext"] < MAX_EXT and last["t"] != t.get("ext_t") \
+                and last["dt"] > parse(t["time"]):
+            highs, lows = swings(rows)
+            ok = False
+            if side == "SELL" and lows:
+                ok = (prev["c"] >= lows[-1] > last["c"]
+                      and last["c"] < last["o"] and last["c"] <= e - risk)
+            if side == "BUY" and highs:
+                ok = (prev["c"] <= highs[-1] < last["c"]
+                      and last["c"] > last["o"] and last["c"] >= e + risk)
+            if ok:
+                old_tp = t["tp"]
+                t["tp"] = old_tp + sign * risk
+                t["sl"] = max(t["sl"], e) if side == "BUY" else min(t["sl"], e)
+                t["ext"] += 1
+                t["ext_t"] = last["t"]
+                send(f"Gold {side} ({t['tf']}): still strong\n"
+                     f"New structure break in your direction.\n"
+                     f"Move TP: {old_tp:.2f} -> {t['tp']:.2f}\n"
+                     f"Move SL to breakeven: {t['sl']:.2f}\n"
+                     f"Minas now tracks these new levels.")
+        keep.append(t)
+    state["open"] = keep
+
+def scan():
+    found = 0
+    for tf, mins, htf in SCANS:
+        rows = candles(tf)
+        if not rows or len(rows) < 40:
+            continue
+        if any(o["tf"] == tf for o in state["open"]):
+            continue
+        note = ""
+        if htf:
+            hr = candles(htf)
+            trend = bias(hr) if hr else None
+            if not trend:
+                continue
+            wants = [trend]
+            note = f"\n{htf} trend agrees: {trend}"
+        else:
+            wants = ["BUY", "SELL"]
+        key = f"{tf}:{rows[-1]['t']}"
+        if key in state["sent"]:
+            continue
+        for w in wants:
+            s = mss(rows, w)
+            if not s:
+                continue
+            side, e, sl, tp = s
+            state["sent"].append(key)
+            state["open"].append({
+                "tf": tf, "side": side, "entry": e, "sl": sl, "tp": tp,
+                "risk": abs(e - sl), "time": rows[-1]["t"],
+                "checked": rows[-1]["t"], "n": 0, "ext": 0})
+            send(f"Gold {side} ({tf})\n"
+                 f"Setup: Market shift (MSS){note}\n"
+                 f"Entry: {e:.2f}\nSL: {sl:.2f}\nTP: {tp:.2f}\n"
+                 f"RR: 1:{RR}\n"
+                 f"Minas will track this trade and tell you if TP can move.")
+            found += 1
+            break
+    return found
+
+track()
+found = scan()
+if MANUAL:
+    if ERRORS:
+        send("Minas data error: " + "; ".join(ERRORS))
+    elif not found:
+        send(f"Minas scan done: no new market shift.\n"
+             f"Open trades: {len(state['open'])}\n{record_text()}")
+print("Errors:", ERRORS)
 save_state(state)
