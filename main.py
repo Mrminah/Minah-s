@@ -27,7 +27,7 @@ def load_state():
 
 def save_state(s):
     with open(STATE_FILE, "w") as f:
-        json.dump(s[-200:], f)
+        json.dump(s[-300:], f)
 
 def get_candles(interval, size=150):
     r = requests.get(
@@ -41,7 +41,7 @@ def get_candles(interval, size=150):
     rows = [{"t": v["datetime"], "h": float(v["high"]),
              "l": float(v["low"]), "c": float(v["close"])}
             for v in reversed(d["values"])]
-    return rows[:-1], None  # drop the still-forming candle
+    return rows[:-1], None
 
 def swings(rows):
     highs, lows = [], []
@@ -63,23 +63,65 @@ def bias(rows):
         return "SELL"
     return None
 
-def market_structure(rows):
+def build(side, entry, sl):
+    risk = abs(entry - sl)
+    if risk < MIN_RISK:
+        return None
+    tp = entry + MIN_RR * risk if side == "BUY" else entry - MIN_RR * risk
+    return (side, entry, sl, tp)
+
+# ---------- Strategy 1: break of structure ----------
+def structure(rows, want):
     highs, lows = swings(rows)
     if not highs or not lows:
         return None
     last, prev = rows[-1]["c"], rows[-2]["c"]
     H, L = highs[-1], lows[-1]
-    if prev <= H < last:
-        sl = L - BUFFER
-        risk = last - sl
-        if risk >= MIN_RISK:
-            return ("BUY", last, sl, last + MIN_RR * risk)
-    if prev >= L > last:
-        sl = H + BUFFER
-        risk = sl - last
-        if risk >= MIN_RISK:
-            return ("SELL", last, sl, last - MIN_RR * risk)
+    if want == "BUY" and prev <= H < last:
+        return build("BUY", last, L - BUFFER)
+    if want == "SELL" and prev >= L > last:
+        return build("SELL", last, H + BUFFER)
     return None
+
+# ---------- Strategy 2: fair value gap retest ----------
+def fvg(rows, want):
+    last = rows[-1]
+    for i in range(len(rows) - 2, max(len(rows) - 32, 2), -1):
+        a, c = rows[i - 2], rows[i]
+        between = rows[i + 1:-1]
+        if want == "BUY" and a["h"] < c["l"]:
+            lo, hi = a["h"], c["l"]
+            if any(x["l"] <= hi for x in between):
+                continue  # gap already tested
+            if last["l"] <= hi and last["c"] > lo:
+                return build("BUY", last["c"], lo - BUFFER)
+            return None
+        if want == "SELL" and a["l"] > c["h"]:
+            lo, hi = c["h"], a["l"]
+            if any(x["h"] >= lo for x in between):
+                continue
+            if last["h"] >= lo and last["c"] < hi:
+                return build("SELL", last["c"], hi + BUFFER)
+            return None
+    return None
+
+# ---------- Strategy 3: liquidity sweep ----------
+def sweep(rows, want):
+    highs, lows = swings(rows)
+    last, prev = rows[-1], rows[-2]
+    if want == "SELL" and highs:
+        H = highs[-1]
+        if last["h"] > H and last["c"] < H and prev["h"] <= H:
+            return build("SELL", last["c"], last["h"] + BUFFER)
+    if want == "BUY" and lows:
+        L = lows[-1]
+        if last["l"] < L and last["c"] > L and prev["l"] >= L:
+            return build("BUY", last["c"], last["l"] - BUFFER)
+    return None
+
+STRATS = [("Structure break", structure),
+          ("Fair value gap", fvg),
+          ("Liquidity sweep", sweep)]
 
 state = load_state()
 rows4, err = get_candles("4h")
@@ -100,18 +142,26 @@ else:
             if err:
                 print(tf, "error:", err)
                 continue
-            setup = market_structure(rows)
-            if not setup or setup[0] != trend:
+            hits = []
+            for name, fn in STRATS:
+                s = fn(rows, trend)
+                if s:
+                    hits.append((name, s))
+            new = [(n, s) for n, s in hits
+                   if f"{n}:{tf}:{trend}:{rows[-1]['t']}" not in state]
+            if not new:
                 continue
-            side, e, sl, tp = setup
-            key = f"{tf}:{side}:{rows[-1]['t']}"
-            if key in state:
-                continue
-            send(f"Gold {side} ({tf} structure break)\n"
+            side, e, sl, tp = new[0][1]
+            names = " + ".join(n for n, _ in new)
+            strength = "STRONG (confluence)" if len(new) > 1 else "Normal"
+            send(f"Gold {side} ({tf})\n"
+                 f"Setup: {names}\n"
+                 f"Strength: {strength}\n"
                  f"4h trend: {trend}\n"
                  f"Entry: {e:.2f}\nSL: {sl:.2f}\nTP: {tp:.2f}\n"
                  f"RR: 1:{MIN_RR}")
-            state.append(key)
+            for n, _ in new:
+                state.append(f"{n}:{tf}:{trend}:{rows[-1]['t']}")
             sent_any = True
         if not sent_any and MANUAL:
             send(f"Minas scan done: 4h trend {trend}, no setup right now.")
