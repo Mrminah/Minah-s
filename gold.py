@@ -25,7 +25,7 @@ PLAN = {
 RR_MIN = 2.0
 MAX_RR = 5.0
 BUF_PCT = 0.02
-MIN_RISK_PCT = {"15min": 0.10, "1h": 0.20, "4h": 0.40}
+MIN_RISK_PCT = {"15min": 0.15, "1h": 0.20, "4h": 0.40}
 MAX_RISK_PCT = {"15min": 0.40, "1h": 0.90, "4h": 1.80}
 PEND_MAX = {"15min": 8, "1h": 16, "4h": 32}      # 15m candles
 HOLD_MAX = {"15min": 96, "1h": 288, "4h": 672}   # 15m candles
@@ -33,6 +33,7 @@ MAX_OPEN = 2
 MAX_PER_DAY = 5
 MAX_EXT = 1
 USE_HTF = True    # False = ignore the bigger trend (more signals)
+MIN_POINTS_15M = 2    # 15m signals need 2+ confirmations
 
 ERRORS = []
 
@@ -466,10 +467,12 @@ def main():
         if any(t["side"] == side for t in state["trades"]):
             continue
         state["sent"].extend(keys)
-        state["day"]["n"] += 1
         s = group[0][1]
         lv = at_level(rows, s["entry"])
         points = len(group) + (1 if lv else 0)
+        if tf == "15min" and points < MIN_POINTS_15M:
+            continue
+        state["day"]["n"] += 1
         strength = ("STRONG" if points >= 3 else "Good" if points == 2
                     else "Normal")
         state["trades"].append({
